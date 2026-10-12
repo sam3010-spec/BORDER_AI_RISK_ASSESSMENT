@@ -1,99 +1,104 @@
+"""
+More defensible SHAP + permutation importance evaluation.
+Run after the revised cross-validation script. SHAP is still explanatory,
+not evidence of causality or real-world validity.
+"""
 import os
-import joblib
-import pandas as pd
 import numpy as np
+import pandas as pd
+import joblib
 import shap
+import matplotlib.pyplot as plt
+from sklearn.inspection import permutation_importance
+from sklearn.model_selection import StratifiedKFold
+from sklearn.metrics import f1_score
+from sklearn.base import clone
 
-def run_shap_explainability(model_path="models/random_forest_model.joblib",
-                             master_dataset_path="data/processed/master_risk_dataset.csv",
-                             output_dir="models"):
-    """
-    Computes SHAP (SHapley Additive exPlanations) for the Random Forest border risk model.
-    Generates global feature importances and local zone-specific risk driver explanations.
-    """
-    print(f"[SHAP Explainer] Loading model from {model_path} and dataset from {master_dataset_path}...")
-    
-    if not os.path.exists(model_path):
-        raise FileNotFoundError(f"Model artifact not found at {model_path}")
-        
-    artifact = joblib.load(model_path)
-    rf_model = artifact["model"]
-    feature_names = artifact["feature_names"]
-    
-    df = pd.read_csv(master_dataset_path)
-    X = df[feature_names].copy()
+TARGET_ORDER = ["Low", "Medium", "High", "Critical"]
+EXCLUDE = {"Zone_ID","Latitude","Longitude","Land_Cover","Risk_Score","Risk_Level",
+           "Environmental_Risk_Score","Operational_Risk_Score","Historical_Risk_Score"}
 
-    # Initialize SHAP TreeExplainer
-    explainer = shap.TreeExplainer(rf_model)
-    shap_values = explainer.shap_values(X)
+def evaluate_explainability(dataset="data/processed/master_risk_dataset.csv",
+                            outdir="models/revised/explainability", seed=42):
+    os.makedirs(outdir, exist_ok=True)
+    df = pd.read_csv(dataset).dropna(subset=["Risk_Level"]).reset_index(drop=True)
+    X = df[[c for c in df.columns if c not in EXCLUDE]].copy()
+    y = pd.Categorical(df["Risk_Level"], categories=TARGET_ORDER, ordered=True).codes
 
-    # For multiclass, shap_values can be a list or 3D array (samples, features, classes)
+    # Cross-fold permutation importance on held-out data; lower F1 after
+    # shuffling a feature means the model relied on that feature in that fold.
+    from sklearn.impute import SimpleImputer
+    from sklearn.ensemble import RandomForestClassifier
+    from sklearn.pipeline import Pipeline
+    model_template = Pipeline([
+        ("imputer", SimpleImputer(strategy="median")),
+        ("model", RandomForestClassifier(n_estimators=300, min_samples_leaf=2,
+                                         class_weight="balanced", random_state=seed,
+                                         n_jobs=-1))
+    ])
+    cv = StratifiedKFold(n_splits=5, shuffle=True, random_state=seed)
+    perm_rows = []
+    fold_models = []
+    for fold, (tr, va) in enumerate(cv.split(X, y), start=1):
+        model = clone(model_template).fit(X.iloc[tr], y[tr])
+        fold_models.append(model)
+        base_f1 = f1_score(y[va], model.predict(X.iloc[va]), average="weighted", zero_division=0)
+        perm = permutation_importance(model, X.iloc[va], y[va], scoring="f1_weighted",
+                                      n_repeats=20, random_state=seed+fold, n_jobs=-1)
+        for i, feature in enumerate(X.columns):
+            perm_rows.append({"Fold":fold, "Feature":feature,
+                              "Permutation_Importance_Mean":perm.importances_mean[i],
+                              "Permutation_Importance_SD":perm.importances_std[i],
+                              "Fold_Baseline_Weighted_F1":base_f1})
+    perm_df = pd.DataFrame(perm_rows)
+    perm_df.to_csv(os.path.join(outdir, "permutation_importance_by_fold.csv"), index=False)
+    perm_summary = perm_df.groupby("Feature").agg(
+        Mean_Importance=("Permutation_Importance_Mean","mean"),
+        SD_Across_Folds=("Permutation_Importance_Mean","std")
+    ).sort_values("Mean_Importance", ascending=False)
+    perm_summary.to_csv(os.path.join(outdir, "permutation_importance_summary.csv"))
+
+    # SHAP explanations for a fold model on held-out observations only.
+    # Use one fold's model and held-out rows for an illustrative explanation;
+    # do not call this a complete stability analysis.
+    tr, va = next(iter(cv.split(X, y)))
+    model = clone(model_template).fit(X.iloc[tr], y[tr])
+    tree = model.named_steps["model"]
+    X_eval = X.iloc[va]
+    explainer = shap.TreeExplainer(tree)
+    shap_values = explainer.shap_values(model.named_steps["imputer"].transform(X_eval))
+
+    # Normalize SHAP output shape across SHAP versions.
     if isinstance(shap_values, list):
-        # Average absolute SHAP values across all classes
-        mean_abs_shap = np.mean([np.abs(sv) for sv in shap_values], axis=0) # shape: (samples, features)
-        global_importance = np.mean(mean_abs_shap, axis=0)
+        vals = np.stack(shap_values, axis=-1) # samples, features, classes
     else:
-        # Array shape: (samples, features, classes) or (samples, features)
-        if len(shap_values.shape) == 3:
-            global_importance = np.mean(np.abs(shap_values), axis=(0, 2))
-        else:
-            global_importance = np.mean(np.abs(shap_values), axis=0)
+        vals = np.asarray(shap_values)
+        if vals.ndim == 2:
+            vals = vals[:, :, None]
+        # Some versions can return (samples, classes, features).
+        if vals.shape[1] == len(TARGET_ORDER) and vals.shape[2] == X.shape[1]:
+            vals = np.transpose(vals, (0,2,1))
+    global_imp = np.mean(np.abs(vals), axis=(0,2))
+    shap_summary = pd.DataFrame({"Feature":X.columns,
+                                 "Mean_Absolute_SHAP":global_imp}).sort_values(
+                                     "Mean_Absolute_SHAP", ascending=False)
+    shap_summary.to_csv(os.path.join(outdir, "shap_global_importance_heldout_fold.csv"), index=False)
 
-    importance_df = pd.DataFrame({
-        "Feature": feature_names,
-        "Mean_SHAP_Importance": np.round(global_importance, 6)
-    }).sort_values(by="Mean_SHAP_Importance", ascending=False)
+    plt.figure()
+    plt.barh(shap_summary.head(15)["Feature"][::-1],
+             shap_summary.head(15)["Mean_Absolute_SHAP"][::-1])
+    plt.xlabel("Mean absolute SHAP value (model output scale)")
+    plt.title("SHAP global importance — held-out fold")
+    plt.tight_layout()
+    plt.savefig(os.path.join(outdir, "shap_global_importance.png"), dpi=200)
+    plt.close()
 
-    importance_path = os.path.join(output_dir, "shap_feature_importance.csv")
-    importance_df.to_csv(importance_path, index=False)
-    print(f"[SHAP Explainer] Global feature importances saved to {importance_path}")
-
-    # Generate sample zone local explanations
-    print("\n" + "="*70)
-    print("                ZONE-SPECIFIC SHAP EXPLAINABILITY REPORT")
-    print("="*70)
-
-    # Reverse target map for printing
-    inv_map = {0: "Low", 1: "Medium", 2: "High", 3: "Critical"}
-
-    # Pick top 2 highest risk zones for demonstration
-    top_risk_indices = df.sort_values(by="Risk_Score", ascending=False).head(2).index
-
-    for idx in top_risk_indices:
-        zone_id = df.loc[idx, "Zone_ID"]
-        risk_score = df.loc[idx, "Risk_Score"]
-        risk_level = df.loc[idx, "Risk_Level"]
-        
-        sample_x = X.iloc[idx:idx+1]
-        sample_pred_class = rf_model.predict(sample_x)[0]
-        
-        # Get SHAP values for predicted class
-        if isinstance(shap_values, list):
-            sample_shap = shap_values[sample_pred_class][idx]
-        elif len(shap_values.shape) == 3:
-            sample_shap = shap_values[idx, :, sample_pred_class]
-        else:
-            sample_shap = shap_values[idx]
-
-        feat_shap = list(zip(feature_names, sample_shap, sample_x.values[0]))
-        
-        # Sort by impact
-        increasing = sorted([f for f in feat_shap if f[1] > 0], key=lambda x: x[1], reverse=True)[:4]
-        reducing = sorted([f for f in feat_shap if f[1] < 0], key=lambda x: x[1])[:4]
-
-        print(f"\n📍 Zone: {zone_id}")
-        print(f"   Infiltration Risk Score: {risk_score:.1f}% ({risk_level})")
-        print(f"   Model Predicted Class: {inv_map.get(sample_pred_class, sample_pred_class)}")
-        print("   Top Risk Escalating Factors (+SHAP):")
-        for f_name, s_val, f_val in increasing:
-            print(f"     • {f_name:25s} = {f_val:8.2f} (Impact: +{s_val:.4f})")
-            
-        print("   Top Risk Mitigating Factors (-SHAP):")
-        for f_name, s_val, f_val in reducing:
-            print(f"     • {f_name:25s} = {f_val:8.2f} (Impact: {s_val:.4f})")
-
-    print("="*70 + "\n")
-    return importance_path
+    joined = shap_summary.merge(perm_summary.reset_index(), on="Feature", how="outer")
+    joined.to_csv(os.path.join(outdir, "shap_vs_permutation.csv"), index=False)
+    print("Saved explainability outputs to:", outdir)
+    print(joined.sort_values("Mean_Absolute_SHAP", ascending=False).head(15).to_string(index=False))
+    print("Interpretation caution: correlated inputs can split or distort importance.")
+    print("SHAP/permutation describe model behavior, not causality or real-world validity.")
 
 if __name__ == "__main__":
-    run_shap_explainability()
+    evaluate_explainability()
